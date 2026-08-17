@@ -216,6 +216,47 @@ def call_search(params: dict, page: int = 1, limit: int = PER_PAGE) -> dict:
     return r.json()
 
 
+# --- Auto-delete helpers -----------------------------------------------------
+
+async def delete_message_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback that deletes a single previously-sent result message."""
+    data = ctx.job.data
+    try:
+        await ctx.bot.delete_message(
+            chat_id=data["chat_id"],
+            message_id=data["message_id"],
+        )
+    except Exception as e:
+        # It's harmless if the message was already deleted or too old; just log.
+        log.warning(
+            "Auto-delete failed for chat=%s msg=%s: %s",
+            data.get("chat_id"), data.get("message_id"), e,
+        )
+
+
+def schedule_auto_delete(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    when: int = 60,
+):
+    """
+    Schedule deletion of a result message after `when` seconds.
+
+    Uses a stable job name per user, so each new search / page navigation
+    cancels the previous pending delete and starts a fresh 60s window.
+    Net effect: as long as the user is actively paging through results, the
+    result message stays on screen. After 60s of inactivity, it disappears.
+    """
+    ctx.job_queue.run_once(
+        callback=delete_message_job,
+        when=when,
+        data={"chat_id": chat_id, "message_id": message_id},
+        name=f"autodel_{user_id}",
+    )
+
+
 # --- Strings ---------------------------------------------------------------
 
 WELCOME = (
@@ -356,12 +397,12 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         set_last_query(s, tg_user.id, qs, 1)
         if not is_unlimited(user.role):
             increment_usage(s, tg_user.id)
-        await _send_results(s, qs, params, page=1, user_obj=user, target=update.message)
+        await _send_results(s, qs, params, page=1, user_obj=user, target=update.message, ctx=ctx)
     finally:
         s.close()
 
 
-async def _send_results(s, qs, params, page, user_obj, target):
+async def _send_results(s, qs, params, page, user_obj, target, ctx):
     """Send search results as JSON code block + pagination buttons."""
     try:
         data = call_search(params, page=page, limit=PER_PAGE)
@@ -411,13 +452,22 @@ async def _send_results(s, qs, params, page, user_obj, target):
 
     body = f"```json\n{text}\n```\n\nDeveloper - {DEV_HANDLE}"
     if hasattr(target, "edit_message_text"):
+        # Pagination: edit in place — message_id stays the same, but the
+        # auto-delete job for this user is replaced by a fresh 60s timer.
         await target.edit_message_text(
             body, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup
         )
+        chat_id = target.message.chat_id
+        message_id = target.message.message_id
     else:
-        await target.reply_text(
+        sent = await target.reply_text(
             body, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup
         )
+        chat_id = sent.chat_id
+        message_id = sent.message_id
+
+    # Schedule the result message for auto-deletion after 60s of inactivity.
+    schedule_auto_delete(ctx, user_obj.user_id, chat_id, message_id, when=60)
 
 
 async def on_paginate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -445,7 +495,7 @@ async def on_paginate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         qs = usage.last_query
         params = parse_query(qs)
         set_last_query(s, tg_user.id, qs, new_page)
-        await _send_results(s, qs, params, page=new_page, user_obj=user, target=q)
+        await _send_results(s, qs, params, page=new_page, user_obj=user, target=q, ctx=ctx)
     finally:
         s.close()
 
