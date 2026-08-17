@@ -1,0 +1,40 @@
+# Render Blueprint for the Telegram bot service.
+# All secret env vars are marked sync:false so the operator (you) pastes them
+# in the Render dashboard after the service is created.
+
+services:
+  # Bot runs as a regular Web Service (free tier) — Background Workers are
+  # paid-only on Render. startCommand runs both a tiny HTTP healthcheck and
+  # the bot polling loop.
+  - type: web
+    name: kyrgyz-tg-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    startCommand: bash /app/scripts/start.sh
+    envVars:
+      # Postgres connection string — paste from kyrgyz-data-db on Render
+      # (Internal Connection String, since both services live in the same
+      # account).
+      - key: DATABASE_URL
+        sync: false
+      # Public URL of the FastAPI service created from the OTHER repo.
+      - key: API_URL
+        value: https://kyrgyz-data-api.onrender.com
+      # Search-only API key (created via the /admin UI in the API repo).
+      - key: API_KEY
+        sync: false
+      # Telegram bot credentials
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OWNER_TELEGRAM_ID
+        sync: false
+      # Cosmetic + behavior
+      - key: DEV_HANDLE
+        value: "@xzusty"
+      - key: DAILY_QUOTA
+        value: 5
+      - key: PER_PAGE
+        value: 5
