@@ -1,11 +1,14 @@
 # Render Blueprint for the Telegram bot service.
 # All secret env vars are marked sync:false so the operator (you) pastes them
 # in the Render dashboard after the service is created.
+#
+# Render docker-runtime web services do NOT accept startCommand — the
+# container's behavior is controlled entirely by the Dockerfile's
+# CMD/ENTRYPOINT directives. Our Dockerfile already CMDs
+# `bash /app/scripts/start.sh` which starts the HTTP healthcheck server
+# in the background and the bot polling loop in the foreground.
 
 services:
-  # Bot runs as a regular Web Service (free tier) — Background Workers are
-  # paid-only on Render. startCommand runs both a tiny HTTP healthcheck and
-  # the bot polling loop.
   - type: web
     name: kyrgyz-tg-bot
     runtime: docker
@@ -13,7 +16,6 @@ services:
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     healthCheckPath: /health
-    startCommand: bash /app/scripts/start.sh
     envVars:
       # Postgres connection string — paste from kyrgyz-data-db on Render
       # (Internal Connection String, since both services live in the same
