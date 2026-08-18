@@ -14,6 +14,7 @@ Roles:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -217,20 +218,30 @@ def call_search(params: dict, page: int = 1, limit: int = PER_PAGE) -> dict:
 
 
 # --- Auto-delete helpers -----------------------------------------------------
+# We use plain asyncio.create_task instead of python-telegram-bot's JobQueue.
+# Reason: JobQueue requires APScheduler to be installed in the container; if
+# it isn't, `ctx.job_queue.run_once(...)` silently does nothing — message
+# never gets deleted. Using asyncio directly works on any asyncio loop.
 
-async def delete_message_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """JobQueue callback that deletes a single previously-sent result message."""
-    data = ctx.job.data
+# Per-user asyncio task tracking. Keyed by user_id so each new search cancels
+# the previous pending delete and starts a fresh timer.
+_active_deletes: dict[int, asyncio.Task] = {}
+
+
+async def _delete_after(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
+    """Sleep `delay` seconds then delete. Cancellable."""
     try:
-        await ctx.bot.delete_message(
-            chat_id=data["chat_id"],
-            message_id=data["message_id"],
-        )
+        await asyncio.sleep(delay)
+        await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        log.info("Auto-deleted message chat=%s msg=%s after %ss", chat_id, message_id, delay)
+    except asyncio.CancelledError:
+        # A newer message arrived — that's why we got cancelled. Silent.
+        pass
     except Exception as e:
-        # It's harmless if the message was already deleted or too old; just log.
+        # Harmless if message was already deleted (e.g. user purged) or too old
         log.warning(
             "Auto-delete failed for chat=%s msg=%s: %s",
-            data.get("chat_id"), data.get("message_id"), e,
+            chat_id, message_id, e,
         )
 
 
@@ -244,17 +255,19 @@ def schedule_auto_delete(
     """
     Schedule deletion of a result message after `when` seconds.
 
-    Uses a stable job name per user, so each new search / page navigation
-    cancels the previous pending delete and starts a fresh 60s window.
-    Net effect: as long as the user is actively paging through results, the
-    result message stays on screen. After 60s of inactivity, it disappears.
+    Per-user task: each new search / page navigation cancels the previous
+    pending delete and starts a fresh timer. Net effect: as long as the
+    user is actively paging through results, the result message stays on
+    screen. After `when` seconds of inactivity, it disappears.
     """
-    ctx.job_queue.run_once(
-        callback=delete_message_job,
-        when=when,
-        data={"chat_id": chat_id, "message_id": message_id},
-        name=f"autodel_{user_id}",
-    )
+    # Cancel any previous pending delete for this user.
+    prev = _active_deletes.get(user_id)
+    if prev is not None and not prev.done():
+        prev.cancel()
+
+    # Schedule a new delete.
+    task = asyncio.create_task(_delete_after(ctx, chat_id, message_id, when))
+    _active_deletes[user_id] = task
 
 
 # --- Strings ---------------------------------------------------------------
